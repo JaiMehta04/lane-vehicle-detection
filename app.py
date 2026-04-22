@@ -8,6 +8,7 @@ Usage:
     streamlit run app.py
 """
 
+import io
 import os
 import tempfile
 import time
@@ -21,7 +22,9 @@ from PIL import Image
 from src.lane_detection import detect_lanes
 from src.advanced_lane_detection import AdvancedLaneDetector, compute_metrics
 from src.car_detection import VehicleDetector
-from config import MODEL_PATH, OUTPUT_DIR
+from config import MODEL_PATH, OUTPUT_DIR, ADV_LANE_PARAMS
+
+DEFAULT_VIDEO = os.path.join("data", "challenge.mp4")
 
 # ──────────────────────────────────────────────
 # Page Configuration
@@ -176,13 +179,24 @@ def process_video_upload(uploaded_file, selected_mode, lane_mode, progress_bar, 
     tfile.write(uploaded_file.read())
     tfile.close()
 
+    output_path, metrics = _process_video_file(
+        tfile.name, selected_mode, lane_mode, progress_bar, status_text,
+    )
+
+    # Clean up temp file
+    os.unlink(tfile.name)
+    return output_path, metrics
+
+
+def _process_video_file(input_path, selected_mode, lane_mode, progress_bar, status_text):
+    """Process a video from a file path and return (output_path, final_metrics)."""
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     output_path = os.path.join(OUTPUT_DIR, f"web_result_{int(time.time())}.mp4")
 
     lane_det = AdvancedLaneDetector() if (lane_mode == "advanced" and selected_mode in ("lane", "both")) else None
     car_det = load_vehicle_detector() if selected_mode in ("car", "both") else None
 
-    clip = VideoFileClip(tfile.name)
+    clip = VideoFileClip(input_path)
     total_frames = int(clip.fps * clip.duration)
     frame_count = [0]
     last_metrics = [None]
@@ -202,9 +216,6 @@ def process_video_upload(uploaded_file, selected_mode, lane_mode, progress_bar, 
     result_clip = clip.fl_image(_process)
     result_clip.write_videofile(output_path, audio=False, logger=None)
 
-    # Clean up temp file
-    os.unlink(tfile.name)
-
     return output_path, last_metrics[0]
 
 
@@ -215,28 +226,131 @@ def process_video_upload(uploaded_file, selected_mode, lane_mode, progress_bar, 
 st.markdown('<p class="main-header">Lane & Vehicle Detection System</p>', unsafe_allow_html=True)
 st.markdown(
     '<p class="sub-header">'
-    'Upload a dash-cam image or video to detect lane lines and vehicles with real-time metrics.'
+    'Detect lane lines and vehicles from dash-cam footage with real-time metrics. '
+    'A default demo runs automatically — or upload your own file below.'
     '</p>',
     unsafe_allow_html=True,
 )
 
 uploaded_file = st.file_uploader(
-    "Upload an image or video",
+    "Upload your own image or video (optional)",
     type=["jpg", "jpeg", "png", "bmp", "mp4", "avi", "mov"],
-    help="Supported: JPG, PNG, BMP images and MP4, AVI, MOV videos",
+    help="Leave empty to use the default demo video (challenge.mp4)",
 )
 
-if uploaded_file is not None:
+# ── Determine source ──
+using_default = uploaded_file is None
+if using_default:
+    st.info("🎬 Using default demo video: **challenge.mp4**. Upload a file above to use your own.", icon="📽️")
+
+# ── Warn if vehicle model missing ──
+if selected_mode in ("car", "both") and not os.path.isfile(MODEL_PATH):
+    st.warning(
+        "⚠️ Vehicle detection model not found. "
+        "Run `python main.py --train` first to train the SVM classifier.",
+        icon="⚠️",
+    )
+    if selected_mode == "car":
+        st.stop()
+
+# ──────────────────────────────────────────────
+# DEFAULT DEMO VIDEO
+# ──────────────────────────────────────────────
+
+if using_default:
+    if not os.path.isfile(DEFAULT_VIDEO):
+        st.error(f"Default video not found at `{DEFAULT_VIDEO}`.")
+        st.stop()
+
+    col_orig, col_result = st.columns(2)
+
+    with col_orig:
+        st.markdown("### 🎬 Original Video")
+        st.video(DEFAULT_VIDEO)
+
+    # Check if we already processed this mode combo (cached in session state)
+    cache_key = f"default_result_{selected_mode}_{lane_mode}"
+    metrics_key = f"default_metrics_{selected_mode}_{lane_mode}"
+
+    if cache_key not in st.session_state:
+        with col_result:
+            st.markdown("### 🎯 Detection Result")
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+
+            output_path, metrics = _process_video_file(
+                DEFAULT_VIDEO, selected_mode, lane_mode, progress_bar, status_text,
+            )
+
+            progress_bar.progress(1.0)
+            status_text.text("✅ Processing complete!")
+
+            st.session_state[cache_key] = output_path
+            st.session_state[metrics_key] = metrics
+
+    result_path = st.session_state[cache_key]
+    metrics = st.session_state.get(metrics_key)
+
+    with col_result:
+        if cache_key in st.session_state:
+            st.markdown("### 🎯 Detection Result")
+        st.video(result_path)
+
+    # Metrics
+    if metrics:
+        st.markdown("---")
+        st.markdown("### 📊 Lane Metrics")
+        m1, m2, m3 = st.columns(3)
+
+        curv = metrics["avg_curvature_m"]
+        offset = metrics["center_offset_m"]
+        lane_w_m = metrics["lane_width_px"] * ADV_LANE_PARAMS["metrics"]["meters_per_pixel_x"]
+
+        with m1:
+            st.markdown(
+                f'<div class="metric-card">'
+                f'<div class="metric-value">{"~Straight" if curv > 5000 else f"{curv:.0f} m"}</div>'
+                f'<div class="metric-label">Road Curvature Radius</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+        with m2:
+            direction = "right" if offset > 0 else "left"
+            st.markdown(
+                f'<div class="metric-card">'
+                f'<div class="metric-value">{abs(offset):.2f} m</div>'
+                f'<div class="metric-label">Center Offset ({direction})</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+        with m3:
+            st.markdown(
+                f'<div class="metric-card">'
+                f'<div class="metric-value">{lane_w_m:.2f} m</div>'
+                f'<div class="metric-label">Detected Lane Width</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+    # Download
+    with open(result_path, "rb") as f:
+        st.download_button(
+            "⬇️ Download Result Video",
+            data=f.read(),
+            file_name="detection_result.mp4",
+            mime="video/mp4",
+        )
+
+# ──────────────────────────────────────────────
+# USER-UPLOADED FILE
+# ──────────────────────────────────────────────
+
+elif uploaded_file is not None:
     file_ext = os.path.splitext(uploaded_file.name)[1].lower()
     is_video = file_ext in (".mp4", ".avi", ".mov", ".mkv")
 
     # Warn if vehicle detection needed but no model
     if selected_mode in ("car", "both") and not os.path.isfile(MODEL_PATH):
-        st.warning(
-            "⚠️ Vehicle detection model not found. "
-            "Run `python main.py --train` first to train the SVM classifier.",
-            icon="⚠️",
-        )
         if selected_mode == "car":
             st.stop()
 
@@ -264,7 +378,6 @@ if uploaded_file is not None:
 
             curv = metrics["avg_curvature_m"]
             offset = metrics["center_offset_m"]
-            from config import ADV_LANE_PARAMS
             lane_w_m = metrics["lane_width_px"] * ADV_LANE_PARAMS["metrics"]["meters_per_pixel_x"]
 
             with m1:
@@ -297,7 +410,6 @@ if uploaded_file is not None:
 
         # Download button
         result_pil = Image.fromarray(result_img)
-        import io
         buf = io.BytesIO()
         result_pil.save(buf, format="PNG")
         st.download_button(
@@ -335,7 +447,6 @@ if uploaded_file is not None:
 
                 curv = metrics["avg_curvature_m"]
                 offset = metrics["center_offset_m"]
-                from config import ADV_LANE_PARAMS
                 lane_w_m = metrics["lane_width_px"] * ADV_LANE_PARAMS["metrics"]["meters_per_pixel_x"]
 
                 with m1:
@@ -372,30 +483,3 @@ if uploaded_file is not None:
                     file_name="detection_result.mp4",
                     mime="video/mp4",
                 )
-
-else:
-    # Landing state — show sample capabilities
-    st.markdown("---")
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-        st.markdown(
-            "#### 🛣️ Lane Detection\n"
-            "Detects curved and straight lane lines using bird's-eye perspective "
-            "transform and polynomial fitting."
-        )
-    with col2:
-        st.markdown(
-            "#### 🚗 Vehicle Detection\n"
-            "Identifies vehicles using HOG features and a trained Linear SVM "
-            "with sliding-window search and heatmap filtering."
-        )
-    with col3:
-        st.markdown(
-            "#### 📊 Real-Time Metrics\n"
-            "Displays road curvature, vehicle center offset, and lane width "
-            "overlaid on every processed frame."
-        )
-
-    st.markdown("---")
-    st.info("👆 Upload a dash-cam image or video above to get started!", icon="📤")
