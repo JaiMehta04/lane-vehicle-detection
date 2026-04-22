@@ -1,3 +1,0 @@
-GitHub : https://github.com/AyushPanchal/lane-and-car-detection-using-cv-and-image-processing.git
-
-Youtube : https://www.youtube.com/watch?v=mNpseFMLwLs
